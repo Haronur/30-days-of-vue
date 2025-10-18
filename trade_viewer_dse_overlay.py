@@ -6,7 +6,7 @@ import numpy as np
 from datetime import datetime, time
 import pytz
 import dash
-from dash import dcc, html, Input, Output, State
+from dash import dcc, html, Input, Output, State, dash_table
 import dash.exceptions
 import plotly.graph_objects as go
 from collections import OrderedDict
@@ -215,6 +215,20 @@ def resample_data(df, rule):
             df_r[c] = pd.to_numeric(df_r[c], errors="coerce").fillna(0)
     return df_r
 
+# ---------------- Indicators ----------------
+def compute_rsi(close_series: pd.Series, period: int = 14) -> pd.Series:
+    if close_series is None or len(close_series) == 0:
+        return pd.Series([], dtype=float)
+    close_series = pd.to_numeric(close_series, errors="coerce")
+    delta = close_series.diff()
+    gain = delta.clip(lower=0.0)
+    loss = -delta.clip(upper=0.0)
+    avg_gain = gain.rolling(window=period, min_periods=period).mean()
+    avg_loss = loss.rolling(window=period, min_periods=period).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    rsi = 100 - (100 / (1 + rs))
+    return rsi.fillna(method="bfill").fillna(50.0)
+
 # ---------------- Cache helper (with optional df_input + window for virtual scroll) ----------------
 def get_resampled(symbol, interval, df_input=None, window=None):
     """
@@ -319,7 +333,7 @@ app.layout = html.Div([
         ),
 
         # --- WATCHLIST controls (inline) ---
-        dcc.Store(id="watchlist-store", data=[]),
+        dcc.Store(id="watchlist-store", data=[], storage_type="local"),
         html.Div([
             dcc.Input(id="watch-input", placeholder="Symbol", type="text", style={"width": "100px", "marginLeft":"12px"}),
             html.Button("Add", id="add-watch-btn", n_clicks=0, style={"marginLeft":"6px"}),
@@ -334,12 +348,127 @@ app.layout = html.Div([
 
     # ---- Watchlist results (scanner) ----
     html.Div(id="watchlist-table", style={"margin":"6px auto","width":"95%"}),
+    dcc.Interval(id="wl-interval", interval=60*1000, n_intervals=0),
 
     # ==== Graph placeholder ====
     dcc.Graph(id="chart", style={"height": "120vh"}),
 ])
 
 # ---------------- WATCHLIST CALLBACK (merged add + remove) ----------------
+@app.callback(
+    Output("watchlist-table", "children"),
+    Input("watchlist-store", "data"),
+    Input("interval-dropdown", "value"),
+    Input("wl-interval", "n_intervals"),
+)
+def render_watchlist_table(store, interval, _n):
+    # normalize store list
+    if not store:
+        return html.Div("Watchlist is empty.", style={"color":"#bbb"})
+    if isinstance(store, str):
+        symbols_list = [store]
+    else:
+        try:
+            symbols_list = list(store)
+        except Exception:
+            symbols_list = []
+    symbols_list = [s.strip().upper() for s in symbols_list if isinstance(s, str) and s.strip()]
+    symbols_list = [s for s in symbols_list if s in symbols]
+    if not symbols_list:
+        return html.Div("No valid symbols in watchlist.", style={"color":"#bbb"})
+
+    rows = []
+    for sym in symbols_list:
+        # use last 120 days for intraday, else 2 years
+        is_intraday = str(interval).upper() not in ("1D", "1W")
+        end = df_base.index.max()
+        lookback_days = 120 if is_intraday else 730
+        start = end - pd.Timedelta(days=lookback_days)
+        df_ticks = df_base[df_base["Symbol"] == sym]
+        if df_ticks.empty:
+            continue
+        df_rs = get_resampled(sym, interval, df_input=df_ticks, window=(start, end))
+        if df_rs.empty:
+            continue
+        # last row metrics
+        last = df_rs.iloc[-1]
+        close = float(last.get("Close", np.nan))
+        open_ = float(last.get("Open", np.nan))
+        high = float(last.get("High", np.nan))
+        low = float(last.get("Low", np.nan))
+        vol = float(last.get("Volume", 0.0))
+        vwap_all = float(last.get("vwap_TMP", np.nan)) if "vwap_TMP" in df_rs.columns else np.nan
+        delta_vol_pct = float(last.get("DeltaVolPct", 0.0))
+
+        # compute change from previous close
+        prev_close = float(df_rs["Close"].iloc[-2]) if len(df_rs) > 1 else np.nan
+        chg = (close - prev_close) if not np.isnan(prev_close) else np.nan
+        chg_pct = (chg / prev_close * 100.0) if prev_close and not np.isnan(prev_close) and prev_close != 0 else np.nan
+
+        # compute RSI over closes
+        rsi = float(compute_rsi(df_rs["Close"], period=14).iloc[-1]) if len(df_rs) >= 14 else np.nan
+
+        rows.append({
+            "Symbol": sym,
+            "Price": round(close, 2) if np.isfinite(close) else None,
+            "Chg%": round(chg_pct, 2) if np.isfinite(chg_pct) else None,
+            "Vol": int(vol),
+            "ΔVol%": round(delta_vol_pct, 1) if np.isfinite(delta_vol_pct) else None,
+            "VWAP": round(vwap_all, 2) if np.isfinite(vwap_all) else None,
+            "RSI14": round(rsi, 1) if np.isfinite(rsi) else None,
+        })
+
+    if not rows:
+        return html.Div("No data for watchlist.", style={"color":"#bbb"})
+
+    columns = [
+        {"name": "Symbol", "id": "Symbol"},
+        {"name": "Price", "id": "Price", "type": "numeric", "format": {"specifier": ",.2f"}},
+        {"name": "Chg%", "id": "Chg%", "type": "numeric", "format": {"specifier": ",.2f"}},
+        {"name": "Vol", "id": "Vol", "type": "numeric", "format": {"specifier": ","}},
+        {"name": "ΔVol%", "id": "ΔVol%", "type": "numeric", "format": {"specifier": ",.1f"}},
+        {"name": "VWAP", "id": "VWAP", "type": "numeric", "format": {"specifier": ",.2f"}},
+        {"name": "RSI14", "id": "RSI14", "type": "numeric", "format": {"specifier": ",.1f"}},
+    ]
+
+    style_data_conditional = [
+        {
+            "if": {"filter_query": '{Chg%} > 0', "column_id": "Chg%"},
+            "color": "#1ecb1e"
+        },
+        {
+            "if": {"filter_query": '{Chg%} < 0', "column_id": "Chg%"},
+            "color": "#ff5c5c"
+        },
+        {
+            "if": {"filter_query": '{ΔVol%} > 0', "column_id": "ΔVol%"},
+            "color": "#e6d200"
+        },
+        {
+            "if": {"filter_query": '{RSI14} >= 70', "column_id": "RSI14"},
+            "backgroundColor": "#3d1f1f"
+        },
+        {
+            "if": {"filter_query": '{RSI14} <= 30', "column_id": "RSI14"},
+            "backgroundColor": "#1f3d1f"
+        },
+    ]
+
+    return dash_table.DataTable(
+        id="watch-datatable",
+        columns=columns,
+        data=rows,
+        sort_action="native",
+        filter_action="native",
+        page_action="none",
+        style_table={"overflowX": "auto"},
+        style_as_list_view=True,
+        style_header={"backgroundColor": "#222", "fontWeight": "600"},
+        style_cell={"backgroundColor": "#111", "color": "#ddd", "padding": "6px", "fontFamily": "Arial", "fontSize": 13},
+        style_data_conditional=style_data_conditional,
+        row_selectable="single",
+    )
+
 @app.callback(
     Output("watchlist-store", "data"),
     Input("add-watch-btn", "n_clicks"),
@@ -401,6 +530,42 @@ def modify_watch(add_n, remove_n, add_val, remove_val, store):
         return store
 
     return store
+
+
+# ---------------- Scanner status wiring ----------------
+@app.callback(
+    Output("scanner-status", "children"),
+    Input("run-scanner-btn", "n_clicks"),
+    State("watchlist-store", "data"),
+    prevent_initial_call=True,
+)
+def run_scanner(n_clicks, store):
+    # Placeholder scanner: just echo count and timestamp
+    try:
+        count = len(store) if isinstance(store, list) else (1 if isinstance(store, str) and store else 0)
+    except Exception:
+        count = 0
+    ts = datetime.now(BD_TZ).strftime("%Y-%m-%d %H:%M:%S")
+    return f"Scanned {count} symbols at {ts}"
+
+
+# ---------------- Row click -> load symbol ----------------
+@app.callback(
+    Output("symbol-dropdown", "value"),
+    Input("watch-datatable", "active_cell"),
+    State("watch-datatable", "data"),
+    prevent_initial_call=True,
+)
+def load_symbol_from_watch(active_cell, table_data):
+    if not active_cell or not table_data:
+        raise dash.exceptions.PreventUpdate()
+    row = active_cell.get("row")
+    if row is None or row >= len(table_data):
+        raise dash.exceptions.PreventUpdate()
+    sym = table_data[row].get("Symbol")
+    if not sym:
+        raise dash.exceptions.PreventUpdate()
+    return sym
 
 
 # ---------------- update remove-dropdown options (defensive) ----------------
